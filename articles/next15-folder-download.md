@@ -37,7 +37,11 @@ https://github.com/isirmt/SourceSnap
 
 ## 認証部分
 
-[NextAuth](https://next-auth.js.org/)を利用します。v15でも特に事故は発生せず導入可能でした。
+[NextAuth](https://next-auth.js.org/)の**v5**を利用します。v15でも特に事故は発生せず導入可能でした。
+
+```bash
+npm i next-auth@beta
+```
 
 ### アクセストークンとユーザー名の取得
 
@@ -126,6 +130,12 @@ callbacks: {
 
 ここで、在るべき場所からパラメータをtokenへ一度渡し、sessionに記録します。
 
+```ts:/src/app/api/auth/[...nextauth]/route.ts
+import { handlers } from '@/lib/auth';
+
+export const { GET, POST } = handlers;
+```
+
 ## コンテンツの取得
 
 取得したアクセストークンでリポジトリ内のリストを取得します。GitHub APIとのやり取りにはOctokitを使います。
@@ -135,10 +145,13 @@ callbacks: {
 
 fetch APIでも可能ですが、typesが定義されていることもあり非常におすすめです。
 
-次にSessionからアクセストークンを取得し、octokitのインスタンスを作成するまでを記します。
+@[card](https://www.npmjs.com/package/@octokit/rest)
+
+Sessionからアクセストークンを取得し、octokitのインスタンスを作成するまでを記します。
 
 ```tsx
 import { Session } from 'next-auth';
+import { Octokit } from '@octokit/rest';
 
 export default async function Page() {
   const session: Session | null = await auth();
@@ -164,10 +177,226 @@ const response = await octokit.repos.getContent({
 console.log(response.data);
 ```
 
-これだけでリストとして出力が可能です。型情報の宣言については、
+これだけでリストとして出力が可能です。型情報の宣言については`@octokit/types`パッケージを導入した後、
 
 ```ts
-type GitHubRepoContent = GetResponseTypeFromEndpointMethod<NonNullable<typeof octokit>['repos']['getContent']>['data']
+import { Octokit } from '@octokit/rest';
+import { GetResponseTypeFromEndpointMethod } from '@octokit/types';
+
+type GitHubTreeContent = GetResponseTypeFromEndpointMethod<Octokit['repos']['getContent']>['data']
 ```
 
-これで指定が可能になります。
+これで指定が可能になります。ここの指定方法はメソッドと同じ名前で型を呼び出せます。
+
+### コンテンツの表示
+
+表示は、配列か否かを条件分岐してから`React.ReactNode`を返すことで書きやすくなります。
+
+```tsx
+// リスト形式で返ってくる場合は基本同じ
+const data = response.data;
+
+return (
+  <section>
+    {Array.isArray(data) && (
+      data.map((item) => (
+        <div key={item.id}>{item.name}</div>
+      ))
+    )}
+  </section>
+);
+```
+
+## ダウンロード
+
+ダウンロードを行う過程でCORSとぶつかってしまうため、APIエンドポイントを作成して回避しつつ認証を維持します。
+
+### ファイルの場合
+
+`content.data`の要素内には次のようなものが定義されています。
+
+```ts
+type GitHubReposContent = {
+  type: 'dir' | 'file' | 'submodule' | 'symlink';
+  size: number;
+  name: string;
+  path: string;
+  content?: string;
+  sha: string;
+  url: string;
+  git_url: string | null;
+  html_url: string | null;
+  download_url: string | null;
+  _links: {
+    git: string | null;
+    html: string | null;
+    self: string;
+  };
+};
+```
+
+したがって、`download_url`を渡すことで要件は満たせます。まずは、API側から
+
+```ts:/src/app/api/get-file/route.ts
+import { Octokit } from '@octokit/rest';
+import { NextResponse } from 'next/server';
+import { Session } from 'next-auth';
+import { auth } from '@/lib/auth';
+
+export async function GET(request: Request) {
+  const session: Session | null = await auth();
+
+  if (!session) {
+    return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+  }
+  const { searchParams } = new URL(request.url);
+  const downloadUrl = searchParams.get('download_url');
+
+  if (!downloadUrl) {
+    return NextResponse.json({ error: 'Missing required parameters' }, { status: 400 });
+  }
+
+  try {
+    const octokit = new Octokit({
+      auth: session.access_token,
+    });
+
+    const response = await octokit.request('GET ' + downloadUrl);
+
+    if (response.status !== 200) {
+      throw new Error(`Failed to fetch the file: ${response.status}`);
+    }
+
+    const buffer = Buffer.from(response.data);
+
+    return new NextResponse(buffer, {
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': `attachment; filename="downloaded_file"`,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching the file:', error);
+    return NextResponse.json({ error: 'Error Occurred' }, { status: 500 });
+  }
+}
+```
+
+`try...catch`までが認証の有無とURLが渡されたかの確認、それ以降が`octokit`によるcontentの取得とバッファの作成です。
+ここで、NextAuthのv5要素が現れており、`req`からセッション確認するのではなく、`await auth()`とサーバーサイド共通の記述な部分です。
+
+@[card](https://authjs.dev/getting-started/migrating-to-v5#authentication-methods)
+
+そして、クライアント側でファイルとして保存させます。保存には、`file-saver`を使います。
+
+```bash
+npm i file-saver
+npm i --save @types/file-saver
+```
+
+```ts
+import saveAs from 'file-saver';
+
+try {
+  if (download_url) {
+    const response = await fetch(`/api/get-file?download_url=${encodeURIComponent(download_url)}`);
+    if (!response.ok) {
+      throw new Error('Failed to download file');
+    }
+    const blob = await response.blob();
+    saveAs(blob, name);
+  } else {
+    throw new Error('File does not have a download URL.');
+  }
+} catch (error) {
+  console.error('Failed to download file:', error);
+}
+```
+
+### フォルダの場合
+
+#### フォルダを再帰的に取得する
+
+タイトルの通りコンテンツの配列を取得し、typeがdirの場合は再帰的に配列へ追加していく手法です。先述の発展版なので操作はシンプルです。
+
+zip圧縮まで行い、パッケージは`npm i jszip`で導入します。
+
+```ts:/src/app/api/get-folder/route.ts
+import { Octokit } from '@octokit/rest';
+import JSZip from 'jszip';
+import { NextResponse } from 'next/server';
+import { Session } from 'next-auth';
+import { auth } from '@/lib/auth';
+// 配列部分の型の抽出
+import { GitHubReposContext } from '@/types/GitHubReposContext';
+
+export async function GET(request: Request) {
+  const session: Session | null = await auth();
+
+  if (!session) {
+    return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+  }
+
+  const { searchParams } = new URL(request.url);
+  const owner = searchParams.get('owner');
+  const repo = searchParams.get('repo');
+  const path = searchParams.get('path');
+  const ref = searchParams.get('ref');
+
+  if (!owner || !repo || !path) {
+    return NextResponse.json({ error: 'Missing required parameters' }, { status: 400 });
+  }
+
+  try {
+    const octokit = new Octokit({ auth: session.access_token });
+
+    const files = await getFolderContents(octokit, owner, repo, path, ref);
+
+    const zip = new JSZip();
+
+    for (const file of files) {
+      const fileContent = await octokit.request('GET ' + file.download_url);
+
+      zip.file(file.path, fileContent.data);
+    }
+
+    const zipBlob = await zip.generateAsync({ type: 'blob' });
+
+    return new NextResponse(zipBlob, {
+      headers: {
+        'Content-Type': 'application/zip',
+        'Content-Disposition': `attachment; filename="${repo}.zip"`,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching the file:', error);
+    return NextResponse.json({ error: 'Error Occurred' }, { status: 500 });
+  }
+}
+
+async function getFolderContents(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  path: string,
+  ref: string,
+): Promise<GitHubReposContext[]> {
+  const contents = await octokit.repos.getContent({
+    owner, repo, path, ref,
+  });
+
+  if (contents && Array.isArray(contents.data)) {
+    const files: GitHubReposContext[] = [];
+    for (const item of contents.data) {
+      if (item.type === 'file') {
+        files.push(item);
+      } else if (item.type === 'dir') {
+        const subfolderFiles = await getFolderContents(octokit, owner, repo, item.path, ref);
+        files.push(...subfolderFiles);
+      }
+    }
+
+    return files;
+  } else return [];
+}
+```
