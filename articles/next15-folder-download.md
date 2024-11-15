@@ -2,11 +2,11 @@
 title: "Next.js 15でGitHubのフォルダ ダウンローダーを作った"
 emoji: "📁"
 type: "tech" # tech: 技術記事 / idea: アイデア
-topics: ["nextjs", "githubapi", "oauth"]
-published: false
+topics: ["nextjs", "githubapi", "nextauth"]
+published: true
 ---
 
-GitHubからOAuth認証を通じて任意のリポジトリ内のフォルダをダウンロードするウェブアプリをNext.js 15を通じて制作した記事です。
+GitHubからOAuth認証を通じて任意のリポジトリ内のフォルダをダウンロードするウェブアプリをNext.js 15で制作した記事です。
 
 ## はじめに
 
@@ -31,7 +31,7 @@ https://github.com/isirmt/SourceSnap
 
 ## 選定した技術
 
-- Next.js: ついにv15へメジャーアップデート。未知数ではあるものの体験として使用。
+- Next.js: ついにv15へメジャーアップデート。未知数ではあるものの体験と思い使用。
 - TailwindCSS: 最近お気に入りのスタイリングフレームワーク。`className`に直接書く以上、コンポーネントとして後から独立させる処置にも向いている。プレーンからも移行しやすく開発コストが低くなると思い導入。
 - Vercel: Next.js開発元のサービス。いつの間にかProductionのビルドにもミニツールバーが表示されるようになり、複数人開発における表示エラーがある際も対応しやすくなっている。
 
@@ -47,7 +47,7 @@ npm i next-auth@beta
 
 NextAuthで提供されるSessionのデフォルトオブジェクト内にユーザー名(login)やOAuthのアクセストークンは含まれていません。
 
-これらをTypeScriptでエラーなくオブジェクトへ追加することを目指します。
+これらをTypeScriptで型定義してオブジェクトへ追加することを目指します。
 
 ```ts:/src/lib/auth.ts
 import NextAuth, { Session } from 'next-auth';
@@ -99,7 +99,7 @@ declare module 'next-auth' {
 }
 ```
 
-Sessionという型定義に`access_token`と`user`が追加で入るように宣言します。これでeslint環境下も問題なく記述できます。
+Sessionという型定義に`access_token`が追加で入るように宣言します。これでeslint環境下も問題なく記述できます。
 
 ```ts
 providers: [
@@ -315,9 +315,7 @@ try {
 
 ### フォルダの場合
 
-#### フォルダを再帰的に取得する
-
-タイトルの通りコンテンツの配列を取得し、typeがdirの場合は再帰的に配列へ追加していく手法です。先述の発展版なので操作はシンプルです。
+コンテンツの配列を取得し、typeがdirの場合は再帰的に配列へ追加します。先述の発展版なので操作はシンプルです。
 
 zip圧縮まで行い、パッケージは`npm i jszip`で導入します。
 
@@ -400,3 +398,59 @@ async function getFolderContents(
   } else return [];
 }
 ```
+
+`jszip`はツリー構築にパス指定で十分なので手軽に実装が可能です。
+
+そして、クライアント側で次のように記述します。
+
+```ts
+import saveAs from 'file-saver';
+
+try {
+  const response = await fetch(
+    `/api/get-folder?owner=${encodeURIComponent(owner)}&repo=${encodeURIComponent(repo)}&path=${path}${ref && `&ref=${ref}`}`,
+  );
+  if (!response.ok) {
+    throw new Error('Failed to download folder');
+  }
+  const blob = await response.blob();
+  saveAs(blob, path.split('/').slice(-1)[0]);
+} catch (error) {
+  console.error('Failed to download folder:', error);
+}
+```
+
+`path.split('/').slice(-1)[0]`は`/`区切り配列の1番後ろを取り出しています。
+
+## (おまけ) ダイナミックルーティング
+
+戻るボタンによるエクスペリエンス向上のため、ダイナミックルーティングを利用します。
+
+キャッチオールとして実装しますが今後のページ追加に支障が無いように`/tree`というサブルートを用意します。
+
+- `/tree`: ユーザーのリポジトリ一覧
+- `/tree/{owner}/{repo}/{path}?ref={sha}`: ディレクトリ表示
+
+```tsx:/src/app/tree/[[...slug]]/page.tsx
+export default async function ListPage({
+  params, searchParams,
+}: {
+  params: Promise<{ slug?: string[] }>;
+  searchParams: Promise<{ [key: string]: string }>;
+}) {
+  const [owner, repo, ...pathSegments] = (await params).slug ?? [];
+  const path = pathSegments.join('/');
+
+  const ref = (await searchParams)['ref'];
+
+  return <></>
+}
+```
+
+Next.js 15の変更点として、ダイナミックルーティングの`params`やクエリパラメータの`searchParams`が非同期になりました。
+
+ファイルを2パターンに分けなかったのはownerだけ指定された場合もリポジトリ一覧を表示したかったためです。
+
+## 終わりに
+
+以前まではfetch APIを使っていたのでoctokitがかなり便利でした。開発において型明記しやすいので非常に助かりました。Next15になって、fetchはデフォルトで`no-cache`になったらしいのでアップデートする際は気を付けないといけませんね。
